@@ -1,0 +1,97 @@
+name: Update
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Resolve target version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          current_version=$(sed -n 's/.*version = "\([^"]*\)";.*/\1/p' package.nix)
+
+          target_version=$(gh api repos/JonRC/excalirender/releases/latest --jq .tag_name)
+          target_version=${target_version#v}
+
+          echo "current=${current_version}" >> "$GITHUB_OUTPUT"
+          echo "target=${target_version}" >> "$GITHUB_OUTPUT"
+
+          if [ "$current_version" = "$target_version" ]; then
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date at ${current_version}."
+          else
+            echo "update=true" >> "$GITHUB_OUTPUT"
+            echo "Updating ${current_version} -> ${target_version}."
+          fi
+
+      - name: Update package files
+        if: steps.version.outputs.update == 'true'
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          curl -fsSL -o "$tmpdir/bun.lock" \
+            "https://raw.githubusercontent.com/JonRC/excalirender/v${TARGET_VERSION}/bun.lock"
+
+          bun2nix_rev=$(jq -r '.nodes.bun2nix.locked.rev' flake.lock)
+          nix run "github:nix-community/bun2nix/${bun2nix_rev}" -- \
+            -l "$tmpdir/bun.lock" \
+            -o bun.nix
+
+          src_hash=$(nix-prefetch-url --unpack "https://github.com/JonRC/excalirender/archive/refs/tags/v${TARGET_VERSION}.tar.gz")
+          src_hash=$(nix hash convert --hash-algo sha256 --to sri "$src_hash")
+
+          sed -i "s|version = \"[^\"]*\";|version = \"${TARGET_VERSION}\";|" package.nix
+          sed -i "s|hash = \"[^\"]*\";|hash = \"${src_hash}\";|" package.nix
+
+      - name: Build updated package
+        if: steps.version.outputs.update == 'true'
+        run: nix build .#excalirender --print-build-logs
+
+      - name: Smoke test executable
+        if: steps.version.outputs.update == 'true'
+        run: ./result/bin/excalirender --help
+
+      - name: Create pull request
+        if: steps.version.outputs.update == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/update-excalirender
+          delete-branch: true
+          commit-message: "chore: update excalirender to v${{ steps.version.outputs.target }}"
+          title: "chore: update excalirender to v${{ steps.version.outputs.target }}"
+          body: |
+            Updates the packaged `JonRC/excalirender` release from `v${{ steps.version.outputs.current }}` to `v${{ steps.version.outputs.target }}`.
+
+            This workflow regenerated `bun.nix`, refreshed the source hash in `package.nix`, and verified the package builds successfully.
