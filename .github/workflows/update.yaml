@@ -85,7 +85,7 @@ jobs:
 
       - name: Create pull request
         if: steps.version.outputs.update == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: automation/update-excalirender
           delete-branch: true
